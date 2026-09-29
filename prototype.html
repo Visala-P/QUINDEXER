@@ -1,0 +1,955 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+<title>Ledger Explorer Indexing Completeness &amp; Query Correctness</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=IBM+Plex+Sans:wght@400;500;600;700&display=swap" rel="stylesheet">
+<script src="https://cdn.tailwindcss.com"></script>
+<script>
+tailwind.config = { theme: { extend: { fontFamily: {
+  sans: ['IBM Plex Sans','system-ui','sans-serif'],
+  mono: ['IBM Plex Mono','ui-monospace','monospace'] } } } }
+</script>
+<style>
+  :root{ box-sizing:border-box; padding-top:env(safe-area-inset-top,0px); padding-bottom:env(safe-area-inset-bottom,0px); color-scheme:dark; }
+  html,body{height:100%;margin:0;background:#070b14;}
+  body{font-family:'IBM Plex Sans',system-ui,sans-serif;color:#e2e8f0;}
+  #root{height:100%;}
+  .grid-bg{
+    background-image:
+      radial-gradient(900px 400px at 15% -10%, rgba(56,189,248,.10), transparent 60%),
+      radial-gradient(700px 400px at 90% 0%, rgba(167,139,250,.10), transparent 60%),
+      linear-gradient(rgba(148,163,184,.05) 1px, transparent 1px),
+      linear-gradient(90deg, rgba(148,163,184,.05) 1px, transparent 1px);
+    background-size: auto, auto, 44px 44px, 44px 44px;
+  }
+  ::-webkit-scrollbar{height:8px;width:8px}
+  ::-webkit-scrollbar-thumb{background:#1e293b;border-radius:8px}
+  .scrollx{overflow-x:auto}
+  *:focus-visible{outline:2px solid #38bdf8;outline-offset:2px;border-radius:4px}
+  @keyframes pulseRing{0%{opacity:.3}50%{opacity:1}100%{opacity:.3}}
+  .pulse{animation:pulseRing 1.3s ease-in-out infinite}
+  @keyframes flashIn{from{background:rgba(56,189,248,.22)}to{background:transparent}}
+  .flash{animation:flashIn 1.1s ease-out}
+  @media (prefers-reduced-motion: reduce){*{animation:none!important;transition:none!important}}
+</style>
+</head>
+<body>
+<div id="root"></div>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/react/18.2.0/umd/react.production.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.2.0/umd/react-dom.production.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.23.5/babel.min.js"></script>
+<script type="text/babel" data-presets="react">
+const {useState, useMemo, useEffect, useRef, useCallback} = React;
+
+/* ============================================================
+   data/generate.ts — deterministic, incremental chain producer
+   ============================================================ */
+function mulberry32(a){return function(){a|=0;a=a+0x6D2B79F5|0;let t=Math.imul(a^a>>>15,1|a);t=t+Math.imul(t^t>>>7,61|t)^t;return((t^t>>>14)>>>0)/4294967296;};}
+
+const ACCOUNTS = ["0x7A41C9","0x2FE08B","0xB3D5A1","0x91C74E","0x5E2B60","0xD0A8F2","0x46F3BC","0xE81D57"];
+const ASSETS = ["ASSET-1001","ASSET-1002","ASSET-1003","ASSET-1004","ASSET-1005","ASSET-1006","ASSET-1007","ASSET-1008"];
+const GENESIS_HEIGHT = 50;
+const BLOCK_PERIOD = 2600;   // ms between committed blocks
+const INDEX_PERIOD = 1500;   // ms per indexer write
+
+function makeChain(seed = 20260921){
+  const rnd = mulberry32(seed);
+  const hex = n => Array.from({length:n}, () => "0123456789abcdef"[Math.floor(rnd()*16)]).join("");
+  let prev = "0".repeat(64);
+  let height = 0;
+  return {
+    next(ts){
+      height++;
+      const n = height === 1 ? 1 : 2 + Math.floor(rnd()*5);
+      const txs = [];
+      for (let k = 0; k < n; k++){
+        const s = ACCOUNTS[Math.floor(rnd()*ACCOUNTS.length)];
+        let r = ACCOUNTS[Math.floor(rnd()*ACCOUNTS.length)];
+        if (r === s) r = ACCOUNTS[(ACCOUNTS.indexOf(s)+3) % ACCOUNTS.length];
+        const roll = rnd();
+        const status = roll < 0.9 ? "VALID" : (roll < 0.955 ? "MVCC_READ_CONFLICT" : "ENDORSEMENT_POLICY_FAILURE");
+        txs.push({ id: hex(64), block: height, timestamp: ts + k*140,
+                   sender: s, receiver: r, assetId: ASSETS[Math.floor(rnd()*ASSETS.length)],
+                   amount: 5 + Math.floor(rnd()*495), status });
+      }
+      const hash = hex(64);
+      const block = {number: height, hash, prevHash: prev, timestamp: ts, txCount: n};
+      prev = hash;
+      return {block, txs};
+    }
+  };
+}
+
+/* Seed the chain so it already has history when the reviewer opens it */
+function seedLedger(chain){
+  const blocks = [], txs = [];
+  const t0 = Date.now() - GENESIS_HEIGHT * BLOCK_PERIOD;
+  for (let i = 0; i < GENESIS_HEIGHT; i++){
+    const {block, txs:bt} = chain.next(t0 + i * BLOCK_PERIOD);
+    blocks.push(block); txs.push(...bt);
+  }
+  return {blocks, txs};
+}
+
+/* ============================================================
+   data/scenarios.ts — indexer presets, relative to the live tip
+   ============================================================ */
+const SCENARIOS = {
+  complete: {key:"complete", label:"Complete index", hint:"Indexer caught up to the chain tip",
+             build: h => ({indexed: range(1,h), dropped: []})},
+  behind:   {key:"behind",   label:"Behind index",   hint:"Indexer trailing the tip by 3 blocks",
+             build: h => ({indexed: range(1, Math.max(1,h-3)), dropped: []})},
+  gap:      {key:"gap",      label:"Gap detected",   hint:"Two blocks skipped mid-chain",
+             build: h => { const d = [Math.max(1,h-5), Math.max(1,h-4)];
+                           return {indexed: range(1,h).filter(b => !d.includes(b)), dropped: d}; }}
+};
+function range(a,b){const o=[];for(let i=a;i<=b;i++)o.push(i);return o;}
+
+/* ============================================================
+   utils/verify.ts — Verification Engine + Gap Detector
+   ============================================================ */
+function verify(ledger, indexed, dropped){
+  const canonicalHeight = ledger.blocks.length;
+  const indexedBlocks = [...indexed].filter(b => b <= canonicalHeight).sort((a,b)=>a-b);
+  const indexedHeight = indexedBlocks.length ? indexedBlocks[indexedBlocks.length-1] : 0;
+  const missing = [];
+  for (let i = 1; i <= canonicalHeight; i++) if (!indexed.has(i)) missing.push(i);
+  const interior = missing.filter(b => b < indexedHeight);
+  const indexedTxs = ledger.txs.filter(t => indexed.has(t.block));
+  const missingTxs = ledger.txs.filter(t => !indexed.has(t.block));
+  let status = "COMPLETE";
+  if (interior.length > 0) status = "NON-CONTIGUOUS INDEX";
+  else if (missing.length > 0) status = "INDEXING LAG";
+  return {
+    set: indexed, dropped, indexedBlocks, indexedHeight, canonicalHeight,
+    missing, interior, contiguous: interior.length === 0,
+    indexedTxs, missingTxs,
+    canonicalTxCount: ledger.txs.length, indexedTxCount: indexedTxs.length,
+    status, complete: missing.length === 0,
+    coverage: canonicalHeight ? (indexedBlocks.length / canonicalHeight) * 100 : 0,
+    lag: canonicalHeight - indexedHeight
+  };
+}
+
+function balanceOf(txs, addr){
+  let bal = 0;
+  txs.forEach(t => { if (t.status !== "VALID") return;
+    if (t.receiver === addr) bal += t.amount;
+    if (t.sender === addr) bal -= t.amount; });
+  return bal;
+}
+
+/* ============================================================
+   utils/format.ts
+   ============================================================ */
+const fmtTime = ms => new Date(ms).toISOString().replace("T"," ").slice(0,19) + " UTC";
+const clock = ms => new Date(ms).toISOString().slice(11,19);
+const shortHash = (h, n=10) => h.slice(0,n) + "…" + h.slice(-4);
+const compress = nums => {
+  if (!nums.length) return "none";
+  const out = []; let s = nums[0], p = nums[0];
+  for (let i=1;i<nums.length;i++){ if (nums[i] === p+1){p=nums[i];continue;} out.push(s===p?`${s}`:`${s}–${p}`); s=p=nums[i]; }
+  out.push(s===p?`${s}`:`${s}–${p}`); return out.join(", ");
+};
+
+/* ============================================================
+   components/ui.tsx
+   ============================================================ */
+const TONE = {
+  ok:    {chip:"bg-emerald-500/10 text-emerald-300 ring-emerald-500/30", dot:"bg-emerald-400", bar:"bg-emerald-400"},
+  warn:  {chip:"bg-amber-500/10 text-amber-300 ring-amber-500/30",       dot:"bg-amber-400",   bar:"bg-amber-400"},
+  bad:   {chip:"bg-rose-500/10 text-rose-300 ring-rose-500/30",          dot:"bg-rose-400",    bar:"bg-rose-400"},
+  info:  {chip:"bg-sky-500/10 text-sky-300 ring-sky-500/30",             dot:"bg-sky-400",     bar:"bg-sky-400"},
+  muted: {chip:"bg-slate-500/10 text-slate-300 ring-slate-500/30",       dot:"bg-slate-400",   bar:"bg-slate-500"}
+};
+
+function Badge({tone="muted", children, dot}){
+  const t = TONE[tone] || TONE.muted;
+  return <span className={`inline-flex items-center gap-1.5 rounded-md px-2 py-0.5 text-xs font-medium ring-1 ring-inset ${t.chip}`}>
+    {dot && <span className={`h-1.5 w-1.5 rounded-full ${t.dot}`} />}{children}</span>;
+}
+
+function Panel({title, note, right, children, className=""}){
+  return <section className={`rounded-xl border border-slate-800 bg-slate-900/50 ${className}`}>
+    {(title || right) && <header className="flex flex-wrap items-center justify-between gap-2 border-b border-slate-800 px-4 py-3">
+      <div><h2 className="text-sm font-semibold text-slate-100">{title}</h2>
+      {note && <p className="mt-0.5 text-xs text-slate-400">{note}</p>}</div>{right}
+    </header>}
+    <div className="p-4">{children}</div>
+  </section>;
+}
+
+function Stat({label, value, sub, tone="muted", accent, live}){
+  const t = TONE[tone] || TONE.muted;
+  return <div className="relative overflow-hidden rounded-xl border border-slate-800 bg-slate-900/50 p-4">
+    <div className={`absolute inset-x-0 top-0 h-0.5 ${t.bar}`} />
+    <p className="flex items-center gap-1.5 text-xs text-slate-400">{label}
+      {live && <span className="pulse h-1.5 w-1.5 rounded-full bg-sky-400" />}</p>
+    <p className={`mt-1 font-mono text-2xl font-semibold ${accent || "text-slate-50"}`}>{value}</p>
+    {sub && <p className="mt-1 text-xs text-slate-500">{sub}</p>}
+  </div>;
+}
+
+function Field({label, children}){
+  return <label className="block"><span className="mb-1 block text-xs text-slate-400">{label}</span>{children}</label>;
+}
+const inputCls = "w-full rounded-lg border border-slate-700 bg-slate-950/70 px-3 py-2 text-sm text-slate-100 placeholder-slate-600 focus:border-sky-500 focus:outline-none";
+const btn = "rounded-lg border border-slate-700 px-3 py-1.5 text-xs font-medium text-slate-200 hover:bg-slate-800";
+
+function TxStatus({s}){ return <Badge tone={s === "VALID" ? "ok" : "bad"}>{s}</Badge>; }
+
+function BlockStrip({report, onPick, selected, limit=60}){
+  const start = Math.max(1, report.canonicalHeight - limit + 1);
+  return <div>
+    <div className="flex flex-wrap gap-1">
+      {range(start, report.canonicalHeight).map(n => {
+        const inIdx = report.set.has(n);
+        const isSel = selected === n;
+        return <button key={n} onClick={() => onPick && onPick(n)} title={`Block ${n} — ${inIdx?"indexed":"not indexed"}`}
+          className={`h-7 w-7 rounded text-[10px] font-mono transition-colors
+            ${inIdx ? "bg-emerald-500/15 text-emerald-300 hover:bg-emerald-500/30"
+                    : "bg-rose-500/20 text-rose-200 ring-1 ring-rose-500/50 hover:bg-rose-500/40"}
+            ${isSel ? "ring-2 ring-sky-400" : ""}`}>{n}</button>;
+      })}
+    </div>
+    {start > 1 && <p className="mt-2 text-xs text-slate-600">Showing the most recent {limit} blocks. Blocks 1–{start-1} are indexed.</p>}
+  </div>;
+}
+
+/* ============================================================
+   components/Pipeline.tsx
+   ============================================================ */
+const STAGES = [
+  {n:"01", name:"Blockchain",          desc:"Read blocks & transactions"},
+  {n:"02", name:"Indexer",             desc:"Index blockchain data"},
+  {n:"03", name:"MongoDB",             desc:"Store searchable copy"},
+  {n:"04", name:"Verification Engine", desc:"Compare indexed vs live state"},
+  {n:"05", name:"Gap Detector",        desc:"Detect missing blocks"},
+  {n:"06", name:"Validation",          desc:"Check query correctness"},
+  {n:"07", name:"REST API",            desc:"Expose verified results"},
+  {n:"08", name:"React Dashboard",     desc:"Display status & warnings"}
+];
+
+function Pipeline({active}){
+  return <div className="scrollx -mx-1 px-1">
+    <ol className="flex min-w-max items-stretch gap-2">
+      {STAGES.map((s, i) => {
+        const now = active === i;
+        return <li key={s.n} className="flex items-center gap-2">
+          <div className={`w-40 rounded-lg border px-3 py-2 transition-colors
+            ${now ? "border-sky-400 bg-sky-500/10" : "border-slate-700 bg-slate-900"}`}>
+            <div className="flex items-center gap-2">
+              <span className="font-mono text-[10px] text-sky-300">{s.n}</span>
+              <span className="text-xs font-semibold text-slate-100">{s.name}</span>
+              {now && <span className="pulse ml-auto h-1.5 w-1.5 rounded-full bg-sky-400" />}
+            </div>
+            <p className="mt-0.5 text-[11px] leading-tight text-slate-400">{s.desc}</p>
+          </div>
+          {i < STAGES.length-1 && <span className="text-sky-500/70">&rarr;</span>}
+        </li>;
+      })}
+    </ol>
+  </div>;
+}
+
+/* ============================================================
+   components/GapAlert.tsx
+   ============================================================ */
+function GapAlert({report, compact}){
+  if (report.complete)
+    return <div className="rounded-xl border border-emerald-600/40 bg-emerald-500/5 p-4">
+      <Badge tone="ok" dot>Index complete</Badge>
+      <p className="mt-2 text-sm text-slate-300">Every canonical block from 1 to {report.canonicalHeight} is present in the index. Query results can be served as final.</p>
+    </div>;
+  return <div className={`rounded-xl border p-4 ${report.contiguous ? "border-amber-600/40 bg-amber-500/5" : "border-rose-600/40 bg-rose-500/5"}`}>
+    <div className="flex flex-wrap items-center gap-2">
+      <Badge tone={report.contiguous ? "warn" : "bad"} dot>{report.status}</Badge>
+      <span className="text-xs text-slate-400">{report.missing.length} of {report.canonicalHeight} blocks unindexed</span>
+    </div>
+    <p className="mt-2 text-sm text-slate-200">
+      Missing blocks <span className="font-mono text-slate-50">{compress(report.missing)}</span> — {report.missingTxs.length} transactions in the canonical chain cannot be returned by any query.
+    </p>
+    {!compact && <p className="mt-2 text-sm text-slate-400">Results derived from this index are partial. The explorer discloses the gap instead of rendering a confident answer.</p>}
+  </div>;
+}
+
+/* ============================================================
+   components/LiveFeed.tsx
+   ============================================================ */
+function LiveFeed({events}){
+  return <div className="max-h-72 space-y-1 overflow-y-auto font-mono text-xs">
+    {events.length === 0 && <p className="py-6 text-center text-slate-600">Start the chain to see activity.</p>}
+    {events.map(e => <div key={e.id} className="flash flex gap-3 rounded px-2 py-1.5">
+      <span className="text-slate-600">{clock(e.t)}</span>
+      <span className={e.tone === "bad" ? "text-rose-300" : e.tone === "ok" ? "text-emerald-300" : e.tone === "warn" ? "text-amber-300" : "text-slate-300"}>{e.msg}</span>
+    </div>)}
+  </div>;
+}
+
+/* Throughput of the most recent blocks, red where the index has no copy */
+function Throughput({ledger, report}){
+  const last = ledger.blocks.slice(-28);
+  const max = Math.max(...last.map(b => b.txCount), 1);
+  return <div className="flex h-20 items-end gap-1">
+    {last.map(b => {
+      const inIdx = report.set.has(b.number);
+      return <div key={b.number} title={`Block ${b.number} · ${b.txCount} tx`} className="flex-1"
+        style={{height: (b.txCount / max) * 100 + "%"}}>
+        <div className={`h-full w-full rounded-sm ${inIdx ? "bg-sky-500/60" : "bg-rose-500/70"}`} />
+      </div>;
+    })}
+  </div>;
+}
+
+/* ============================================================
+   components/IndexerControls.tsx — the reviewer's demo console
+   ============================================================ */
+function IndexerControls({ctl, report}){
+  return <div className="grid gap-3 sm:grid-cols-2">
+    <div className="rounded-lg border border-slate-800 bg-slate-950/50 p-3">
+      <p className="text-xs text-slate-400">Chain producer</p>
+      <div className="mt-2 flex flex-wrap items-center gap-2">
+        <button onClick={ctl.toggleChain} className={`rounded-lg px-3 py-1.5 text-xs font-semibold ${ctl.chainOn ? "bg-slate-100 text-slate-900" : "bg-sky-500 text-slate-950"}`}>
+          {ctl.chainOn ? "Pause chain" : "Start chain"}
+        </button>
+        <span className="text-xs text-slate-500">a block every {(BLOCK_PERIOD/1000).toFixed(1)}s</span>
+      </div>
+    </div>
+    <div className="rounded-lg border border-slate-800 bg-slate-950/50 p-3">
+      <p className="text-xs text-slate-400">Indexer</p>
+      <div className="mt-2 flex flex-wrap items-center gap-2">
+        <button onClick={ctl.toggleIndexer} className={`rounded-lg px-3 py-1.5 text-xs font-semibold ${ctl.indexerOn ? "bg-slate-100 text-slate-900" : "bg-emerald-500 text-slate-950"}`}>
+          {ctl.indexerOn ? "Stop indexer" : "Resume indexer"}
+        </button>
+        <button onClick={ctl.dropNext} className="rounded-lg bg-rose-500/90 px-3 py-1.5 text-xs font-semibold text-slate-950 hover:bg-rose-400">Drop next block</button>
+      </div>
+    </div>
+    <div className="sm:col-span-2 flex flex-wrap items-center gap-2 rounded-lg border border-slate-800 bg-slate-950/50 p-3">
+      <span className="text-xs text-slate-400">Jump to a state:</span>
+      {Object.values(SCENARIOS).map(s =>
+        <button key={s.key} onClick={() => ctl.preset(s.key)} title={s.hint} className={btn}>{s.label}</button>)}
+      <span className="ml-auto text-xs text-slate-500">
+        {ctl.indexerOn ? `Indexer ${report.lag > 0 ? "catching up · " + report.lag + " behind" : "at tip"}` : "Indexer stopped — the gap will widen"}
+      </span>
+    </div>
+  </div>;
+}
+
+/* ============================================================
+   pages/Overview.tsx
+   ============================================================ */
+function Overview({ledger, report, run, ctl, events, goto, live}){
+  return <div className="space-y-5">
+    <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-4">
+      <Stat live={ctl.chainOn} label="Canonical block height" value={report.canonicalHeight} sub="Read from the ledger peer" tone="info" accent="text-sky-300" />
+      <Stat live={ctl.indexerOn} label="Indexed block height" value={report.indexedHeight}
+            sub={report.complete ? "At chain tip" : `${report.lag} block${report.lag===1?"":"s"} behind tip`}
+            tone={report.complete ? "ok" : "warn"} accent={report.complete ? "text-emerald-300" : "text-amber-300"} />
+      <Stat label="Indexed transactions" value={report.indexedTxCount} sub={`${report.canonicalTxCount} in canonical chain`} tone="muted" />
+      <Stat label="Detected gaps" value={report.missing.length}
+            sub={report.missing.length ? `Blocks ${compress(report.missing)}` : "No gaps detected"}
+            tone={report.missing.length ? "bad" : "ok"} accent={report.missing.length ? "text-rose-300" : "text-emerald-300"} />
+    </div>
+
+    <Panel title="Demo console" note="Drive the live system: pause the indexer to create lag, drop a block to create a hole">
+      <IndexerControls ctl={ctl} report={report} />
+    </Panel>
+
+    <div className="grid gap-5 lg:grid-cols-3">
+      <div className="space-y-5 lg:col-span-2">
+        <Panel title="Verification pipeline" note="Methodology from the project charter, running continuously against the live chain"
+               right={<Badge tone={report.complete ? "ok" : "warn"} dot>{report.status}</Badge>}>
+          <Pipeline active={run.stage} />
+          <div className="mt-4 flex flex-wrap items-center gap-3">
+            <button onClick={run.start} disabled={run.running}
+              className="rounded-lg bg-sky-500 px-4 py-2 text-sm font-semibold text-slate-950 hover:bg-sky-400 disabled:opacity-50">
+              {run.running ? "Verifying…" : "Run verification now"}
+            </button>
+            <span className="text-xs text-slate-400">
+              {run.running ? STAGES[run.stage].name : `Last full check ${clock(run.lastRun)} UTC · re-verified on every block`}
+            </span>
+          </div>
+        </Panel>
+        <GapAlert report={report} />
+        <Panel title="Transactions per block" note="Last 28 blocks · red bars are blocks the index never received">
+          <Throughput ledger={ledger} report={report} />
+        </Panel>
+      </div>
+
+      <div className="space-y-5">
+        <Panel title="Live activity" note="Chain, indexer and gap detector events"
+               right={<Badge tone={live ? "info" : "muted"} dot>{live ? "streaming" : "paused"}</Badge>}>
+          <LiveFeed events={events} />
+        </Panel>
+        <Panel title="Index coverage" note={`${report.indexedBlocks.length} of ${report.canonicalHeight} blocks stored`}>
+          <div className="mb-3 h-2 w-full overflow-hidden rounded-full bg-slate-800">
+            <div className={`h-full transition-all duration-500 ${report.complete ? "bg-emerald-400" : "bg-amber-400"}`} style={{width: report.coverage + "%"}} />
+          </div>
+          <p className="mb-4 font-mono text-3xl text-slate-50">{report.coverage.toFixed(1)}<span className="text-lg text-slate-500">%</span></p>
+          <BlockStrip report={report} limit={30} />
+          <button onClick={() => goto("gaps")} className="mt-4 w-full rounded-lg border border-slate-700 px-3 py-2 text-sm text-slate-200 hover:bg-slate-800">Open gap detector</button>
+        </Panel>
+      </div>
+    </div>
+  </div>;
+}
+
+/* ============================================================
+   pages/Ledger.tsx
+   ============================================================ */
+function Ledger({ledger, report}){
+  const [sel, setSel] = useState(null);
+  const block = sel ? ledger.blocks.find(b => b.number === sel) : null;
+  const blockTxs = block ? ledger.txs.filter(t => t.block === block.number) : [];
+  return <div className="grid gap-5 lg:grid-cols-5">
+    <Panel className="lg:col-span-3" title="Canonical ledger" note="Blocks read directly from the chain — newest first, updating live">
+      <div className="max-h-[520px] overflow-y-auto">
+        <table className="w-full text-left text-sm">
+          <thead className="sticky top-0 bg-slate-900 text-xs text-slate-400">
+            <tr><th className="px-2 py-2">Block</th><th className="px-2 py-2">Hash</th><th className="px-2 py-2">Txs</th><th className="px-2 py-2">Committed</th><th className="px-2 py-2">Index</th></tr>
+          </thead>
+          <tbody>
+            {ledger.blocks.slice().reverse().map(b => {
+              const inIdx = report.set.has(b.number);
+              return <tr key={b.number} onClick={() => setSel(b.number)}
+                className={`cursor-pointer border-t border-slate-800/70 hover:bg-slate-800/40 ${sel===b.number?"bg-sky-500/10":""}`}>
+                <td className="px-2 py-2 font-mono text-slate-100">#{b.number}</td>
+                <td className="px-2 py-2 font-mono text-xs text-slate-400">{shortHash(b.hash, 12)}</td>
+                <td className="px-2 py-2 font-mono text-slate-300">{b.txCount}</td>
+                <td className="px-2 py-2 font-mono text-xs text-slate-500">{clock(b.timestamp)}</td>
+                <td className="px-2 py-2">{inIdx ? <Badge tone="ok">indexed</Badge> : <Badge tone="bad" dot>not indexed</Badge>}</td>
+              </tr>;
+            })}
+          </tbody>
+        </table>
+      </div>
+    </Panel>
+
+    <Panel className="lg:col-span-2" title={block ? `Block #${block.number}` : "Block detail"} note={block ? null : "Select a block to inspect it"}>
+      {!block && <p className="py-10 text-center text-sm text-slate-500">Pick a block from the canonical ledger.</p>}
+      {block && <div className="space-y-3 text-sm">
+        <div>{report.set.has(block.number)
+          ? <Badge tone="ok" dot>Present in index</Badge>
+          : <Badge tone="bad" dot>Missing from index — queries cannot see these transactions</Badge>}</div>
+        <Row k="Block number" v={"#" + block.number} />
+        <Row k="Block hash" v={block.hash} wrap />
+        <Row k="Previous hash" v={block.prevHash} wrap />
+        <Row k="Timestamp" v={fmtTime(block.timestamp)} />
+        <Row k="Transaction count" v={block.txCount} />
+        <div className="pt-2">
+          <p className="mb-2 text-xs text-slate-400">Transactions</p>
+          <div className="space-y-1">
+            {blockTxs.map(t => <div key={t.id} className="rounded-lg border border-slate-800 bg-slate-950/50 px-3 py-2">
+              <p className="font-mono text-xs text-slate-300">{shortHash(t.id, 16)}</p>
+              <p className="mt-1 text-xs text-slate-500">{t.sender} &rarr; {t.receiver} · {t.assetId} · {t.amount}</p>
+            </div>)}
+          </div>
+        </div>
+      </div>}
+    </Panel>
+  </div>;
+}
+function Row({k, v, wrap}){
+  return <div className="flex gap-3 border-b border-slate-800/60 pb-2">
+    <span className="w-32 shrink-0 text-xs text-slate-400">{k}</span>
+    <span className={`font-mono text-xs text-slate-100 ${wrap ? "break-all" : ""}`}>{v}</span>
+  </div>;
+}
+
+/* ============================================================
+   pages/Explorer.tsx
+   ============================================================ */
+function Explorer({report}){
+  const [q, setQ] = useState("");
+  const [blk, setBlk] = useState("");
+  const [status, setStatus] = useState("all");
+  const rows = useMemo(() => report.indexedTxs.filter(t => {
+    if (blk && String(t.block) !== blk.trim()) return false;
+    if (status !== "all" && t.status !== status) return false;
+    if (q){ const s = q.trim().toLowerCase();
+      if (!(t.id.startsWith(s) || t.sender.toLowerCase().includes(s) || t.receiver.toLowerCase().includes(s) || t.assetId.toLowerCase().includes(s))) return false; }
+    return true;
+  }).reverse(), [report, q, blk, status]);
+
+  return <div className="space-y-5">
+    <Panel title="Indexed data explorer" note="Served from the index — never from the chain directly. New rows appear as the indexer writes them.">
+      <div className="grid gap-3 sm:grid-cols-3">
+        <Field label="Search transaction ID, address or asset">
+          <input className={inputCls} placeholder="e.g. 0xB3D5A1 or ASSET-1003" value={q} onChange={e => setQ(e.target.value)} />
+        </Field>
+        <Field label="Block number"><input className={inputCls} placeholder="e.g. 37" value={blk} onChange={e => setBlk(e.target.value)} /></Field>
+        <Field label="Validation status">
+          <select className={inputCls} value={status} onChange={e => setStatus(e.target.value)}>
+            <option value="all">All statuses</option><option value="VALID">VALID</option>
+            <option value="MVCC_READ_CONFLICT">MVCC_READ_CONFLICT</option>
+            <option value="ENDORSEMENT_POLICY_FAILURE">ENDORSEMENT_POLICY_FAILURE</option>
+          </select>
+        </Field>
+      </div>
+      <div className="mt-3 flex flex-wrap items-center gap-2 text-xs text-slate-400">
+        <span>{rows.length} transactions match in the index.</span>
+        {report.missingTxs.length > 0 && <Badge tone="warn" dot>{report.missingTxs.length} canonical transactions unreachable — blocks {compress(report.missing)} not indexed</Badge>}
+      </div>
+    </Panel>
+
+    <Panel title={null}>
+      <div className="scrollx max-h-[480px] overflow-y-auto">
+        <table className="w-full min-w-[820px] text-left text-sm">
+          <thead className="sticky top-0 bg-slate-900 text-xs text-slate-400">
+            <tr>{["Transaction ID","Block","Time","Sender","Receiver","Asset","Amount","Status"].map(h => <th key={h} className="px-2 py-2 font-medium">{h}</th>)}</tr>
+          </thead>
+          <tbody>
+            {rows.slice(0, 120).map(t => <tr key={t.id} className="border-t border-slate-800/70 hover:bg-slate-800/40">
+              <td className="px-2 py-2 font-mono text-xs text-sky-300">{shortHash(t.id, 14)}</td>
+              <td className="px-2 py-2 font-mono text-slate-300">#{t.block}</td>
+              <td className="px-2 py-2 font-mono text-xs text-slate-500">{clock(t.timestamp)}</td>
+              <td className="px-2 py-2 font-mono text-xs text-slate-200">{t.sender}</td>
+              <td className="px-2 py-2 font-mono text-xs text-slate-200">{t.receiver}</td>
+              <td className="px-2 py-2 font-mono text-xs text-violet-300">{t.assetId}</td>
+              <td className="px-2 py-2 font-mono text-slate-300">{t.amount}</td>
+              <td className="px-2 py-2"><TxStatus s={t.status} /></td>
+            </tr>)}
+            {rows.length === 0 && <tr><td colSpan={8} className="px-2 py-12 text-center text-sm text-slate-500">
+              No indexed transaction matches these filters. If the block you want sits in a gap, the index has nothing to return.
+            </td></tr>}
+          </tbody>
+        </table>
+      </div>
+      {rows.length > 120 && <p className="mt-3 text-xs text-slate-500">Showing the 120 most recent of {rows.length} matches.</p>}
+    </Panel>
+  </div>;
+}
+
+/* ============================================================
+   pages/Verification.tsx
+   ============================================================ */
+function Verification({report, run, ctl}){
+  const checks = [
+    {label:"Chain tip reached", ok: report.lag === 0, detail:`indexed ${report.indexedHeight} / canonical ${report.canonicalHeight}`},
+    {label:"Block range contiguous", ok: report.contiguous, detail: report.contiguous ? "no interior blocks skipped" : `skipped ${compress(report.interior)}`},
+    {label:"Transaction counts agree", ok: report.indexedTxCount === report.canonicalTxCount, detail:`indexed ${report.indexedTxCount} / canonical ${report.canonicalTxCount}`},
+    {label:"Queries safe to serve as final", ok: report.complete, detail: report.complete ? "results match canonical state" : "results must carry a completeness warning"}
+  ];
+  return <div className="space-y-5">
+    <div className="grid gap-5 lg:grid-cols-2">
+      <Panel title="Canonical chain state" note="Ground truth read from the ledger"
+             right={<Badge tone="info" dot>{ctl.chainOn ? "live" : "paused"}</Badge>}>
+        <p className="font-mono text-4xl text-sky-300">{report.canonicalHeight}</p>
+        <p className="mt-1 text-xs text-slate-400">blocks · {report.canonicalTxCount} transactions</p>
+        <div className="mt-4 h-2 w-full rounded-full bg-sky-500/40" />
+        <p className="mt-2 font-mono text-xs text-slate-500">blocks 1–{report.canonicalHeight}</p>
+      </Panel>
+      <Panel title="Indexed state" note="What the explorer would answer from"
+             right={<Badge tone={ctl.indexerOn ? "ok" : "bad"} dot>{ctl.indexerOn ? "indexer running" : "indexer stopped"}</Badge>}>
+        <p className={`font-mono text-4xl ${report.complete ? "text-emerald-300" : "text-amber-300"}`}>{report.indexedHeight}</p>
+        <p className="mt-1 text-xs text-slate-400">blocks · {report.indexedTxCount} transactions</p>
+        <div className="mt-4 h-2 w-full overflow-hidden rounded-full bg-slate-800">
+          <div className={`h-full transition-all duration-500 ${report.complete ? "bg-emerald-400" : "bg-amber-400"}`} style={{width: report.coverage + "%"}} />
+        </div>
+        <p className="mt-2 font-mono text-xs text-slate-500">missing {compress(report.missing)}</p>
+      </Panel>
+    </div>
+
+    <Panel title="Verification engine" note="Indexed state compared against canonical chain state after every committed block"
+           right={<button onClick={run.start} disabled={run.running} className="rounded-lg bg-sky-500 px-3 py-1.5 text-xs font-semibold text-slate-950 hover:bg-sky-400 disabled:opacity-50">
+             {run.running ? "Verifying…" : "Re-run verification"}</button>}>
+      <div className="space-y-2">
+        {checks.map(c => <div key={c.label} className="flex flex-wrap items-center gap-3 rounded-lg border border-slate-800 bg-slate-950/50 px-3 py-2.5">
+          <span className={`font-mono text-sm ${c.ok ? "text-emerald-400" : "text-rose-400"}`}>{c.ok ? "PASS" : "FAIL"}</span>
+          <span className="text-sm text-slate-100">{c.label}</span>
+          <span className="ml-auto font-mono text-xs text-slate-400">{c.detail}</span>
+        </div>)}
+      </div>
+      <p className="mt-4 text-xs text-slate-400">Outcome <span className="font-mono text-slate-100">{report.complete ? "ACCEPT" : "HOLD"}</span> — {report.complete ? "the index may serve queries as final." : "the index may only serve queries that disclose the gap."}</p>
+    </Panel>
+
+    <Panel title="Block-by-block comparison" note="Green is present in both; red exists on chain but not in the index">
+      <BlockStrip report={report} />
+    </Panel>
+  </div>;
+}
+
+/* ============================================================
+   pages/Gaps.tsx
+   ============================================================ */
+function Gaps({report, ledger, events}){
+  return <div className="space-y-5">
+    <GapAlert report={report} />
+    {!report.complete && <>
+      <div className="grid gap-3 sm:grid-cols-3">
+        <Stat label="Missing blocks" value={report.missing.length} sub={compress(report.missing)} tone="bad" accent="text-rose-300" live />
+        <Stat label="Unreachable transactions" value={report.missingTxs.length} sub="On chain, absent from every query result" tone="bad" accent="text-rose-300" />
+        <Stat label="Gap type" value={report.contiguous ? "TAIL LAG" : "INTERIOR SKIP"}
+              sub={report.contiguous ? "Indexer trails the chain tip" : "Indexer wrote past a block it never stored"} tone="warn" accent="text-amber-300" />
+      </div>
+      <Panel title="Detected gaps" note="Expected against indexed, block by block, recomputed on every commit">
+        <div className="scrollx max-h-96 overflow-y-auto">
+          <table className="w-full min-w-[600px] text-left text-sm">
+            <thead className="sticky top-0 bg-slate-900 text-xs text-slate-400"><tr>
+              <th className="px-2 py-2">Expected</th><th className="px-2 py-2">Indexed</th>
+              <th className="px-2 py-2">Block hash (canonical)</th><th className="px-2 py-2">Txs withheld</th><th className="px-2 py-2">Cause</th></tr></thead>
+            <tbody>
+              {report.missing.map(n => {
+                const b = ledger.blocks.find(x => x.number === n);
+                const dropped = report.dropped.includes(n);
+                return <tr key={n} className="border-t border-slate-800/70">
+                  <td className="px-2 py-2 font-mono text-slate-100">Block {n}</td>
+                  <td className="px-2 py-2 font-mono text-rose-300">Missing</td>
+                  <td className="px-2 py-2 font-mono text-xs text-slate-500">{b ? shortHash(b.hash, 12) : "—"}</td>
+                  <td className="px-2 py-2 font-mono text-slate-300">{b ? b.txCount : 0}</td>
+                  <td className="px-2 py-2"><Badge tone="bad" dot>{dropped ? "skipped by indexer" : "not yet indexed"}</Badge></td>
+                </tr>;
+              })}
+            </tbody>
+          </table>
+        </div>
+        <p className="mt-4 text-sm text-slate-400">
+          Until these blocks are indexed, no query result is final. Address balances computed from the index exclude {report.missingTxs.length} transactions,
+          so the explorer reports the state it can prove rather than presenting the partial state as complete.
+        </p>
+      </Panel>
+    </>}
+    <Panel title="Detector log"><LiveFeed events={events.filter(e => e.tone === "bad" || e.tone === "warn" || e.tone === "ok")} /></Panel>
+  </div>;
+}
+
+/* ============================================================
+   pages/Query.tsx
+   ============================================================ */
+const MODES = [
+  {k:"auto", label:"Auto-detect"}, {k:"tx", label:"Transaction ID"},
+  {k:"block", label:"Block number"}, {k:"address", label:"Address"}, {k:"asset", label:"Asset ID"}
+];
+
+function Query({ledger, report}){
+  const [mode, setMode] = useState("auto");
+  const [q, setQ] = useState("0xB3D5A1");
+  const [submitted, setSubmitted] = useState(null);
+
+  const res = useMemo(() => {
+    if (!submitted) return null;
+    const s = submitted.q.trim();
+    let m = submitted.mode;
+    if (m === "auto"){
+      if (/^asset-/i.test(s)) m = "asset";
+      else if (/^\d+$/.test(s)) m = "block";
+      else if (/^0x[0-9a-f]{6}$/i.test(s)) m = "address";
+      else m = "tx";
+    }
+    const match = (txs) => {
+      const v = s.toLowerCase();
+      if (m === "block") return txs.filter(t => String(t.block) === v);
+      if (m === "address") return txs.filter(t => t.sender.toLowerCase() === v || t.receiver.toLowerCase() === v);
+      if (m === "asset") return txs.filter(t => t.assetId.toLowerCase() === v);
+      return txs.filter(t => t.id.startsWith(v.replace(/^0x/, "")));
+    };
+    const indexed = match(report.indexedTxs);
+    const canonical = match(ledger.txs);
+    const gapsInScope = [...new Set(canonical.map(t => t.block))].filter(b => !report.set.has(b)).sort((a,b)=>a-b);
+    const addr = ACCOUNTS.find(a => a.toLowerCase() === s.toLowerCase()) || s;
+    return {
+      mode:m, q:s, indexed, withheld: canonical.length - indexed.length, gapsInScope,
+      indexedBalance: m === "address" ? balanceOf(indexed, addr) : null,
+      canonicalBalance: m === "address" ? balanceOf(canonical, addr) : null,
+      verified: report.complete
+    };
+  }, [submitted, report, ledger]);
+
+  return <div className="space-y-5">
+    <Panel title="Address and transaction queries" note="Every result is re-checked against the verification report as the chain advances">
+      <div className="grid gap-3 sm:grid-cols-[1fr_200px_auto] sm:items-end">
+        <Field label="Query">
+          <input className={inputCls} value={q} onChange={e => setQ(e.target.value)}
+                 onKeyDown={e => e.key === "Enter" && setSubmitted({q, mode})} placeholder="Address, transaction ID, block number or asset" />
+        </Field>
+        <Field label="Interpret as">
+          <select className={inputCls} value={mode} onChange={e => setMode(e.target.value)}>
+            {MODES.map(m => <option key={m.k} value={m.k}>{m.label}</option>)}
+          </select>
+        </Field>
+        <button onClick={() => setSubmitted({q, mode})} className="h-[38px] rounded-lg bg-violet-500 px-5 text-sm font-semibold text-slate-950 hover:bg-violet-400">Search</button>
+      </div>
+      <div className="mt-3 flex flex-wrap gap-2 text-xs">
+        <span className="text-slate-500">Try:</span>
+        {["0xB3D5A1", String(report.canonicalHeight), "ASSET-1003", "0x7A41C9"].map(s =>
+          <button key={s} onClick={() => {setQ(s); setMode("auto"); setSubmitted({q:s, mode:"auto"});}} className="rounded border border-slate-700 px-2 py-0.5 font-mono text-slate-300 hover:bg-slate-800">{s}</button>)}
+      </div>
+    </Panel>
+
+    {!res && <Panel title={null}><p className="py-10 text-center text-sm text-slate-500">Run a query to see how the explorer reports completeness.</p></Panel>}
+
+    {res && <>
+      <div className={`rounded-xl border p-4 ${res.verified ? "border-emerald-600/40 bg-emerald-500/5" : "border-amber-600/40 bg-amber-500/5"}`}>
+        <div className="flex flex-wrap items-center gap-2">
+          {res.verified ? <Badge tone="ok" dot>Result verified against canonical ledger</Badge>
+                        : <Badge tone="warn" dot>Result may be incomplete</Badge>}
+          <span className="text-xs text-slate-400">{res.indexed.length} records returned from the index · checked at height {report.canonicalHeight}</span>
+        </div>
+        {res.verified
+          ? <p className="mt-2 text-sm text-slate-300">The index covers every canonical block, so this result is final.</p>
+          : <div className="mt-2 space-y-1 text-sm text-slate-200">
+              <p><span className="font-semibold text-amber-300">Indexing gap detected.</span> Blocks {compress(report.missing)} are not indexed.</p>
+              {res.gapsInScope.length > 0
+                ? <p>{res.withheld} matching transaction{res.withheld === 1 ? "" : "s"} sit in unindexed block{res.gapsInScope.length === 1 ? "" : "s"} {compress(res.gapsInScope)} and are not shown below.</p>
+                : <p>No matching records fall inside the gap right now, but the index is behind the chain tip, so newer matches may exist.</p>}
+            </div>}
+      </div>
+
+      {res.mode === "address" && <div className="grid gap-3 sm:grid-cols-2">
+        <Stat label="Balance from the index" value={res.indexedBalance}
+              sub={res.verified ? "Complete history" : "Derived from a partial history"}
+              tone={res.verified ? "ok" : "warn"} accent={res.verified ? "text-emerald-300" : "text-amber-300"} />
+        <Stat label="Balance on the canonical chain" value={res.canonicalBalance}
+              sub={res.indexedBalance === res.canonicalBalance ? "Matches the indexed balance" : `Indexed balance is off by ${Math.abs(res.canonicalBalance - res.indexedBalance)}`}
+              tone={res.indexedBalance === res.canonicalBalance ? "ok" : "bad"}
+              accent={res.indexedBalance === res.canonicalBalance ? "text-emerald-300" : "text-rose-300"} />
+      </div>}
+
+      <Panel title="Returned records" note={`Interpreted as ${MODES.find(m => m.k === res.mode).label.toLowerCase()} · "${res.q}"`}>
+        <div className="scrollx max-h-80 overflow-y-auto">
+          <table className="w-full min-w-[720px] text-left text-sm">
+            <thead className="sticky top-0 bg-slate-900 text-xs text-slate-400"><tr>
+              {["Transaction ID","Block","Sender","Receiver","Asset","Amount","Status"].map(h => <th key={h} className="px-2 py-2 font-medium">{h}</th>)}</tr></thead>
+            <tbody>
+              {res.indexed.slice().reverse().map(t => <tr key={t.id} className="border-t border-slate-800/70">
+                <td className="px-2 py-2 font-mono text-xs text-sky-300">{shortHash(t.id, 14)}</td>
+                <td className="px-2 py-2 font-mono text-slate-300">#{t.block}</td>
+                <td className="px-2 py-2 font-mono text-xs text-slate-200">{t.sender}</td>
+                <td className="px-2 py-2 font-mono text-xs text-slate-200">{t.receiver}</td>
+                <td className="px-2 py-2 font-mono text-xs text-violet-300">{t.assetId}</td>
+                <td className="px-2 py-2 font-mono text-slate-300">{t.amount}</td>
+                <td className="px-2 py-2"><TxStatus s={t.status} /></td>
+              </tr>)}
+              {res.indexed.length === 0 && <tr><td colSpan={7} className="px-2 py-10 text-center text-sm text-slate-500">
+                The index holds no record for this query.{!report.complete && " Blocks " + compress(report.missing) + " are missing, so absence here is not proof of absence on chain."}
+              </td></tr>}
+            </tbody>
+          </table>
+        </div>
+      </Panel>
+    </>}
+  </div>;
+}
+
+/* ============================================================
+   pages/IndexingLayer.tsx — EASL / TEASL representation (mock)
+   ============================================================ */
+function IndexingLayer({ledger, report}){
+  const [n, setN] = useState(null);
+  const target = n === null ? report.canonicalHeight : n;
+  const found = report.set.has(target);
+  const b = ledger.blocks.find(x => x.number === target);
+  const steps = [
+    {t:"Blockchain block", v:`Block #${target} · ${b ? shortHash(b.hash, 8) : "—"}`, ok:!!b},
+    {t:"EASL — append-only skip list", v: found ? `entry written at height ${target}` : `no entry at height ${target}`, ok:found},
+    {t:"TEASL — versioned lookup", v: found ? `EASL version ${target} resolved` : `version ${target} never committed`, ok:found},
+    {t:"Indexed block lookup", v: found ? `Block #${target} returned from index` : "lookup fails — gap reported to caller", ok:found}
+  ];
+  return <div className="space-y-5">
+    <Panel title="Indexing layer" note="Prototype visualisation of the EASL / TEASL lookup path — the research algorithms themselves are not implemented here">
+      <div className="flex flex-wrap items-end gap-3">
+        <Field label="Query block">
+          <input type="number" min="1" max={report.canonicalHeight} className={inputCls + " w-32"} value={target}
+                 onChange={e => setN(Math.max(1, Math.min(report.canonicalHeight, Number(e.target.value) || 1)))} />
+        </Field>
+        <div className="pb-2 text-xs text-slate-400">Blocks 1–{report.canonicalHeight} · try one inside a gap: {compress(report.missing)}</div>
+      </div>
+      <ol className="mt-5 space-y-2">
+        {steps.map((s, i) => <li key={s.t} className={`rounded-lg border px-4 py-3 ${s.ok ? "border-slate-700 bg-slate-950/60" : "border-rose-600/50 bg-rose-500/5"}`}>
+          <div className="flex flex-wrap items-center gap-3">
+            <span className={`font-mono text-xs ${s.ok ? "text-sky-400" : "text-rose-400"}`}>{String(i+1).padStart(2,"0")}</span>
+            <span className="text-sm font-semibold text-slate-100">{s.t}</span>
+            <span className="ml-auto font-mono text-xs text-slate-300">{s.v}</span>
+          </div>
+        </li>)}
+      </ol>
+      <p className="mt-4 text-sm text-slate-400">
+        {found ? `Block ${target} resolves through the indexing layer, so an explorer query touching it can be answered from the index.`
+               : `Block ${target} has no EASL entry. A naive explorer would return an empty result; this system reports the gap instead.`}
+      </p>
+    </Panel>
+    <Panel title="Where this sits in the pipeline">
+      <Pipeline active={2} />
+      <p className="mt-3 text-xs text-slate-500">Prototype assumption: EASL/TEASL are shown as the lookup structure between the indexer and the searchable store, matching the methodology diagram.</p>
+    </Panel>
+  </div>;
+}
+
+/* ============================================================
+   App.tsx
+   ============================================================ */
+const NAV = [
+  {k:"overview", label:"Overview"}, {k:"ledger", label:"Canonical ledger"},
+  {k:"explorer", label:"Indexed explorer"}, {k:"verify", label:"Verification"},
+  {k:"gaps", label:"Gap detector"}, {k:"query", label:"Query & correctness"},
+  {k:"easl", label:"Indexing layer"}
+];
+
+function App(){
+  const chain = useRef(null);
+  if (!chain.current) chain.current = makeChain();
+
+  const [ledger, setLedger] = useState(() => seedLedger(chain.current));
+  const [indexed, setIndexed] = useState(() => new Set(range(1, GENESIS_HEIGHT)));
+  const [dropped, setDropped] = useState([]);
+  const [chainOn, setChainOn] = useState(true);
+  const [indexerOn, setIndexerOn] = useState(true);
+  const [events, setEvents] = useState([]);
+  const [page, setPage] = useState("overview");
+  const [now, setNow] = useState(Date.now());
+
+  // refs so interval callbacks always read current values
+  const ledgerRef = useRef(ledger), indexedRef = useRef(indexed), droppedRef = useRef(dropped);
+  const indexerOnRef = useRef(indexerOn), dropNextRef = useRef(false);
+  useEffect(() => { ledgerRef.current = ledger; }, [ledger]);
+  useEffect(() => { indexedRef.current = indexed; }, [indexed]);
+  useEffect(() => { droppedRef.current = dropped; }, [dropped]);
+  useEffect(() => { indexerOnRef.current = indexerOn; }, [indexerOn]);
+
+  const log = useCallback((msg, tone="info") => {
+    setEvents(e => [{id: Math.random().toString(36).slice(2), t: Date.now(), msg, tone}, ...e].slice(0, 60));
+  }, []);
+
+  useEffect(() => { log(`Loaded chain history · height ${GENESIS_HEIGHT} · index synchronised`, "ok"); }, [log]);
+
+  /* Chain producer */
+  useEffect(() => {
+    if (!chainOn) return;
+    const id = setInterval(() => {
+      const {block, txs} = chain.current.next(Date.now());
+      setLedger(p => ({blocks: [...p.blocks, block], txs: [...p.txs, ...txs]}));
+      log(`Block #${block.number} committed · ${block.txCount} tx`, "info");
+      if (dropNextRef.current){
+        dropNextRef.current = false;
+        setDropped(d => [...d, block.number]);
+        log(`Indexer skipped block #${block.number} — write failed`, "bad");
+      }
+    }, BLOCK_PERIOD);
+    return () => clearInterval(id);
+  }, [chainOn, log]);
+
+  /* Indexer: writes the lowest block it has not stored yet */
+  useEffect(() => {
+    const id = setInterval(() => {
+      if (!indexerOnRef.current) return;
+      const tip = ledgerRef.current.blocks.length;
+      const idx = indexedRef.current, drop = droppedRef.current;
+      for (let i = 1; i <= tip; i++){
+        if (!idx.has(i) && !drop.includes(i)){
+          const next = new Set(idx); next.add(i);
+          indexedRef.current = next; setIndexed(next);
+          log(`Indexed block #${i}`, "ok");
+          return;
+        }
+      }
+    }, INDEX_PERIOD);
+    return () => clearInterval(id);
+  }, [log]);
+
+  /* Clock for the header */
+  useEffect(() => { const id = setInterval(() => setNow(Date.now()), 1000); return () => clearInterval(id); }, []);
+
+  const report = useMemo(() => verify(ledger, indexed, dropped), [ledger, indexed, dropped]);
+
+  /* Gap detector announces state changes once, not every tick */
+  const lastStatus = useRef(report.status);
+  useEffect(() => {
+    if (report.status !== lastStatus.current){
+      lastStatus.current = report.status;
+      log(`Gap detector: ${report.status}` + (report.missing.length ? ` · missing ${compress(report.missing)}` : ""),
+          report.complete ? "ok" : report.contiguous ? "warn" : "bad");
+    }
+  }, [report, log]);
+
+  /* Manual verification run animation */
+  const [stage, setStage] = useState(STAGES.length - 1);
+  const [running, setRunning] = useState(false);
+  const [lastRun, setLastRun] = useState(Date.now());
+  const runTimer = useRef(null);
+  const start = () => {
+    if (running) return;
+    setRunning(true); setStage(0);
+    let i = 0;
+    runTimer.current = setInterval(() => {
+      i++;
+      if (i >= STAGES.length){ clearInterval(runTimer.current); setRunning(false); setStage(STAGES.length-1); setLastRun(Date.now()); log("Verification sweep complete", "info"); }
+      else setStage(i);
+    }, 240);
+  };
+  useEffect(() => () => clearInterval(runTimer.current), []);
+
+  const ctl = {
+    chainOn, indexerOn,
+    toggleChain: () => { setChainOn(v => { log(v ? "Chain producer paused" : "Chain producer started", "info"); return !v; }); },
+    toggleIndexer: () => { setIndexerOn(v => { log(v ? "Indexer stopped — index will fall behind" : "Indexer resumed — catching up", v ? "warn" : "ok"); return !v; }); },
+    dropNext: () => { dropNextRef.current = true; log("Fault injected: the indexer will skip the next block", "warn"); },
+    preset: (key) => {
+      const h = ledgerRef.current.blocks.length;
+      const {indexed: idx, dropped: drp} = SCENARIOS[key].build(h);
+      const set = new Set(idx);
+      indexedRef.current = set; droppedRef.current = drp;
+      setIndexed(set); setDropped(drp);
+      log(`Preset applied: ${SCENARIOS[key].label}`, "warn");
+    }
+  };
+
+  const run = {stage, running, start, lastRun};
+  const props = {ledger, report, run, ctl, events, goto:setPage, live: chainOn || indexerOn};
+
+  return <div className="grid-bg flex h-full flex-col">
+    <header className="border-b border-slate-800 bg-slate-950/80 backdrop-blur">
+      <div className="flex flex-wrap items-center gap-x-4 gap-y-3 px-4 py-3 sm:px-6">
+        <div className="min-w-0">
+          <p className="truncate text-sm font-semibold text-slate-50">Ledger Explorer Indexing Completeness &amp; Query Correctness</p>
+          <p className="text-xs text-slate-500">Distributed ledger analytics · capstone prototype · simulated chain, live state</p>
+        </div>
+        <div className="ml-auto flex flex-wrap items-center gap-3">
+          <div className="flex items-center gap-2 rounded-lg border border-slate-800 bg-slate-900 px-3 py-1.5">
+            <span className={`h-2 w-2 rounded-full ${chainOn ? "pulse bg-emerald-400" : "bg-slate-600"}`} />
+            <span className="font-mono text-xs text-slate-300">height {report.canonicalHeight}</span>
+            <span className="text-slate-700">|</span>
+            <span className={`font-mono text-xs ${report.complete ? "text-emerald-300" : "text-amber-300"}`}>index {report.indexedHeight}</span>
+            <span className="text-slate-700">|</span>
+            <span className="font-mono text-xs text-slate-500">{clock(now)}</span>
+          </div>
+          <button onClick={ctl.toggleChain} className={`rounded-lg px-3 py-1.5 text-xs font-semibold ${chainOn ? "bg-slate-100 text-slate-900" : "bg-sky-500 text-slate-950"}`}>
+            {chainOn ? "Pause chain" : "Start chain"}
+          </button>
+        </div>
+      </div>
+      <nav className="scrollx flex gap-1 border-t border-slate-800/80 px-2 sm:px-4">
+        {NAV.map(n => <button key={n.k} onClick={() => setPage(n.k)}
+          className={`whitespace-nowrap border-b-2 px-3 py-2.5 text-sm transition-colors
+            ${page === n.k ? "border-sky-400 text-sky-300" : "border-transparent text-slate-400 hover:text-slate-200"}`}>
+          {n.label}
+          {n.k === "gaps" && report.missing.length > 0 &&
+            <span className="ml-2 rounded bg-rose-500/20 px-1.5 py-0.5 font-mono text-[10px] text-rose-300">{report.missing.length}</span>}
+        </button>)}
+      </nav>
+    </header>
+
+    <main className="flex-1 overflow-y-auto px-4 py-5 sm:px-6">
+      <div className="mx-auto max-w-[1180px]">
+        {page === "overview" && <Overview {...props} />}
+        {page === "ledger"   && <Ledger {...props} />}
+        {page === "explorer" && <Explorer {...props} />}
+        {page === "verify"   && <Verification {...props} />}
+        {page === "gaps"     && <Gaps {...props} />}
+        {page === "query"    && <Query {...props} />}
+        {page === "easl"     && <IndexingLayer {...props} />}
+        <p className="mt-8 text-center text-xs text-slate-600">
+          Prototype · blocks are produced in the browser by a deterministic generator. No Fabric network, chaincode or database is running.
+        </p>
+      </div>
+    </main>
+  </div>;
+}
+
+ReactDOM.createRoot(document.getElementById("root")).render(<App />);
+</script>
+</body>
+</html>
