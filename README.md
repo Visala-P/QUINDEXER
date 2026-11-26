@@ -29,6 +29,12 @@ The **`prototype.html`** file located in the root directory is the **complete, s
 *   **How to view/run**: 
     Simply open the `prototype.html` file directly in any modern web browser (Chrome, Edge, Firefox, or Safari) to launch the frontend.
 
+## 🚀 Live Prototype
+
+Open the deployed prototype at **https://visala-p.github.io/QUINDEXER/**. The page starts the simulated chain and indexer automatically when it loads; no sign-in, local server, or Fabric network is required.
+
+GitHub Actions deploys the standalone `prototype.html` as the site's home page whenever changes are pushed to `main`. The demo runs entirely in the browser and does not connect to a real ledger, backend, or database.
+
 ---
 
 ## 🚀 Getting Started
